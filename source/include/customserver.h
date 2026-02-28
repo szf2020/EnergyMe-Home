@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <vector>
 #include <AdvancedLogger.h>
 #include <ArduinoJson.h>
 #include <AsyncJson.h>
@@ -14,6 +15,7 @@
 #include <Update.h>
 #include "esp_ota_ops.h"
 #include "esp_task_wdt.h"
+#include "mbedtls/base64.h"
 
 #include "constants.h"
 #include "crashmonitor.h"
@@ -62,6 +64,7 @@
 
 // Buffer sizes
 #define HTTP_HEALTH_CHECK_RESPONSE_BUFFER_SIZE 256 // Only needed for health check HTTP response to own server
+#define CONTENT_DISPOSITION_BUFFER_SIZE 256
 
 // Content length validations
 #define HTTP_MAX_CONTENT_LENGTH_LOGS_LEVEL 64

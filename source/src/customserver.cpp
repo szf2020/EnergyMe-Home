@@ -75,6 +75,8 @@ namespace CustomServer
     static void _serveInfluxDbEndpoints();
     static void _serveCrashEndpoints();
     static void _serveLedEndpoints();
+    static void _serveBackupEndpoints();
+    static void _serveRestoreEndpoints();
     static void _serveFileEndpoints();
     
     // Authentication endpoints
@@ -96,15 +98,14 @@ namespace CustomServer
                                    size_t index, uint8_t *data, size_t len, bool final);
     
     // File upload handler
-    static void _handleFileUploadData(AsyncWebServerRequest *request, const String& filename, 
+    static void _handleFileUploadData(AsyncWebServerRequest *request, const String& filename,
                                     size_t index, uint8_t *data, size_t len, bool final);
-    
+
     // OTA helper functions
     static bool _initializeOtaUpload(AsyncWebServerRequest *request, const String& filename);
     static void _setupOtaMd5Verification(AsyncWebServerRequest *request);
     static bool _writeOtaChunk(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index);
     static void _finalizeOtaUpload(AsyncWebServerRequest *request);
-    static void _restoreTaskWatchdog();
     
     // Logging helper functions
     static bool _parseLogLevel(const char *levelStr, LogLevel &level);
@@ -489,12 +490,18 @@ namespace CustomServer
         while (client.connected() && (millis64() - startTime) < HEALTH_CHECK_TIMEOUT_MS && loops < MAX_LOOP_ITERATIONS)
         {
             loops++;
+
+            // Reset task watchdog periodically during HTTP wait
+            if (loops % 50 == 0) {
+                esp_task_wdt_reset();
+            }
+
             if (client.available())
             {
                 char line[HTTP_HEALTH_CHECK_RESPONSE_BUFFER_SIZE];
                 size_t bytesRead = client.readBytesUntil('\n', line, sizeof(line) - 1);
                 line[bytesRead] = '\0';
-                
+
                 if (strncmp(line, "HTTP/1.1 ", 9) == 0 && bytesRead >= 12)
                 {
                     // Extract status code from characters 9-11
@@ -608,6 +615,8 @@ namespace CustomServer
         _serveInfluxDbEndpoints();
         _serveCrashEndpoints();
         _serveLedEndpoints();
+        _serveBackupEndpoints();
+        _serveRestoreEndpoints();
         _serveFileEndpoints();
     }
 
@@ -946,13 +955,10 @@ namespace CustomServer
     {
         // Handle the completion of the upload
         if (request->getResponse()) return;  // Response already set due to error
-        
+
         // Stop OTA timeout task since OTA process is completing
         _stopOtaTimeoutTask();
-        
-        // Re-initialize task watchdog after OTA
-        _restoreTaskWatchdog();
-        
+
         if (Update.hasError()) {
             SpiRamAllocator allocator;
             JsonDocument doc(&allocator);
@@ -1013,31 +1019,6 @@ namespace CustomServer
         }
     }
 
-    static void _restoreTaskWatchdog()
-    {
-        // Re-initialize task watchdog after OTA (it was suspended during OTA flash operations)
-        LOG_DEBUG("Re-initializing task watchdog after OTA");
-        esp_task_wdt_config_t wdt_config = {
-            .timeout_ms = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000,
-            .idle_core_mask = 0b11, // both cores are enabled (enable by setting the bit of the i core to 1)
-            .trigger_panic = true
-        };
-        
-        // Try to reconfigure first (in case deinit didn't fully stop it)
-        esp_err_t err = esp_task_wdt_reconfigure(&wdt_config);
-        if (err == ESP_ERR_INVALID_STATE) {
-            // Watchdog not initialized, initialize it fresh
-            LOG_DEBUG("Watchdog not active, initializing fresh");
-            err = esp_task_wdt_init(&wdt_config);
-        }
-        
-        if (err != ESP_OK) {
-            LOG_ERROR("Failed to restore task watchdog: %s", esp_err_to_name(err));
-        } else {
-            LOG_DEBUG("Task watchdog restored successfully");
-        }
-    }
-
     static bool _initializeOtaUpload(AsyncWebServerRequest *request, const String& filename)
     {
         LOG_INFO("Starting OTA update with file: %s", filename.c_str());
@@ -1075,19 +1056,13 @@ namespace CustomServer
         
         // Start OTA timeout watchdog task before beginning the actual OTA process
         _startOtaTimeoutTask();
-        
-        // Suspend task watchdog to prevent timeout during flash operations
-        // Flash writes disable interrupts/cache which prevents IDLE task from feeding watchdog
-        LOG_DEBUG("Suspending task watchdog for OTA flash operations");
-        esp_task_wdt_deinit(); // Deinitialize watchdog - will be re-initialized after OTA
-        
+
         // Begin OTA update with known size
         if (!Update.begin(contentLength, U_FLASH)) {
             LOG_ERROR("Failed to begin OTA update: %s", Update.errorString());
             _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Failed to begin update");
             Led::doubleBlinkYellow(Led::PRIO_URGENT, 1000ULL);
             _stopOtaTimeoutTask(); // Stop timeout task on failure
-            _restoreTaskWatchdog(); // Restore watchdog on failure
             return false;
         }
         
@@ -1131,31 +1106,33 @@ namespace CustomServer
 
     static bool _writeOtaChunk(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index)
     {
+        // Reset watchdog before flash write
         size_t written = Update.write(data, len);
+
         if (written != len) {
             LOG_ERROR("OTA write failed: expected %zu bytes, wrote %zu bytes", len, written);
             _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Write failed");
             Update.abort();
             _stopOtaTimeoutTask(); // Stop timeout task on write failure
-            _restoreTaskWatchdog(); // Restore watchdog on failure
             return false;
         }
-        
+
         // Log progress periodically
         static size_t lastProgressIndex = 0;
         if (index >= lastProgressIndex + SIZE_REPORT_UPDATE_OTA || index == 0) {
+            esp_task_wdt_reset(); // Only do it once in a while
             float progress = Update.size() > 0UL ? (float)Update.progress() / (float)Update.size() * 100.0f : 0.0f;
             LOG_DEBUG("OTA progress: %.1f%% (%zu / %zu bytes)", progress, Update.progress(), Update.size());
             lastProgressIndex = index;
         }
-        
+
         return true;
     }
 
     static void _finalizeOtaUpload(AsyncWebServerRequest *request)
     {
         LOG_DEBUG("Finalizing OTA update...");
-        
+
         // Validate that we actually received data
         if (Update.progress() == 0) {
             LOG_ERROR("OTA finalization failed: No data received");
@@ -1164,7 +1141,7 @@ namespace CustomServer
             _stopOtaTimeoutTask(); // Stop timeout task on failure
             return;
         }
-        
+
         // Validate minimum size
         if (Update.progress() < MINIMUM_FIRMWARE_SIZE) {
             LOG_ERROR("OTA finalization failed: Firmware too small (%zu bytes)", Update.progress());
@@ -1173,8 +1150,11 @@ namespace CustomServer
             _stopOtaTimeoutTask(); // Stop timeout task on failure
             return;
         }
-        
-        if (!Update.end(true)) {
+
+        // Reset watchdog before flash verification and finalization
+        bool success = Update.end(true);
+
+        if (!success) {
             LOG_ERROR("OTA finalization failed: %s", Update.errorString());
             _stopOtaTimeoutTask(); // Stop timeout task on failure
             // Error response will be handled in the main handler
@@ -1232,6 +1212,7 @@ namespace CustomServer
         // Write data chunk
         if (len && uploadFile) {
             size_t written = uploadFile.write(data, len);
+
             if (written != len) {
                 LOG_ERROR("Failed to write data chunk at index %zu", index);
                 uploadFile.close();
@@ -1318,15 +1299,17 @@ namespace CustomServer
         http.begin(GITHUB_API_RELEASES_URL);
         http.addHeader("User-Agent", "EnergyMe-Home-ESP32");
         http.addHeader("Accept", "application/vnd.github.v3+json");
-        
+
+        // Reset watchdog before network call
         int httpCode = http.GET();
+
         if (httpCode != HTTP_CODE_OK) {
             LOG_WARNING("GitHub API request failed with code: %d", httpCode);
             http.end();
             return false;
         }
-        
-        // Parse GitHub API response
+
+        // Parse GitHub API response - reset before and after data fetch
         String response = http.getString();
         http.end();
 
@@ -2528,7 +2511,7 @@ namespace CustomServer
             SpiRamAllocator allocator;
             JsonDocument doc(&allocator);
             
-            if (CrashMonitor::getCoreDumpChunkJson(doc, offset, chunkSize)) {
+            if (CrashMonitor::getCoreDumpChunkJson(doc, offset, chunkSize)) { // TODO: this should be streamed instead, and the full data raw (no useless JSON)
                 _sendJsonResponse(request, doc);
             } else {
                 _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve core dump data");
@@ -2596,8 +2579,413 @@ namespace CustomServer
         server.addHandler(setLedBrightnessHandler);
     }
 
+    // === BACKUP ENDPOINTS ===
+    static void _serveBackupEndpoints()
+    {
+        server.on("/api/v1/backup/configuration", HTTP_GET, [](AsyncWebServerRequest *request)
+                  {
+            // nvsDataToJson() resets watchdog periodically during iteration
+            AsyncJsonResponse * response = new AsyncJsonResponse();
+            JsonObject doc = response->getRoot().to<JsonObject>();
+
+            if (!nvsDataToJson(doc)) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to retrieve NVS data");
+                LOG_ERROR("Failed to retrieve NVS data for backup request via API");
+                delete response;
+                return;
+            }
+
+            // Add download headers
+            char deviceId[DEVICE_ID_BUFFER_SIZE];
+            getDeviceId(deviceId, sizeof(deviceId));
+            char timestamp[TIMESTAMP_BUFFER_SIZE];
+            CustomTime::getTimestampIso(timestamp, sizeof(timestamp));
+
+            char filename[128];
+            snprintf(filename, sizeof(filename), "attachment; filename=\"config_backup_%s_%s.json\"",
+                     deviceId, timestamp);
+            response->addHeader("Content-Disposition", filename);
+
+            LOG_INFO("Configuration backup requested via API: config_backup_%s_%s.json", deviceId, timestamp);
+            response->setLength();
+            request->send(response);
+        });
+
+        // LittleFS filesystem backup (tar) - streams directly to HTTP response, no temp files
+        server.on("/api/v1/backup/filesystem", HTTP_GET, [](AsyncWebServerRequest *request) {
+            LOG_DEBUG("LittleFS streaming backup requested");
+
+            // Start async TAR creation task
+            RingBufferStream* stream = startStreamingBackup();
+            if (!stream) {
+                _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR, "Failed to start backup stream");
+                LOG_ERROR("Failed to start LittleFS backup stream via API");
+                return;
+            }
+
+            // Set up chunked response that reads from RingBufferStream
+            // Use simpler callback to avoid compiler memory issues
+            AsyncWebServerResponse *response = request->beginChunkedResponse("application/x-tar",
+                [stream](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+                    // Feed watchdog on every callback to prevent timeout during semaphore waits
+                    esp_task_wdt_reset();
+
+                    if (stream->hasError()) {
+                        delete stream;
+                        return 0;
+                    }
+                    size_t bytesRead = stream->readBytes(buffer, maxLen);
+                    if (bytesRead == 0) {
+                        delete stream;
+                    }
+                    return bytesRead;
+                }
+            );
+
+            // Add download headers with device ID and timestamp
+            char deviceId[DEVICE_ID_BUFFER_SIZE];
+            getDeviceId(deviceId, sizeof(deviceId));
+            char timestamp[TIMESTAMP_BUFFER_SIZE];
+            CustomTime::getTimestampIso(timestamp, sizeof(timestamp));
+
+            char filename[128];
+            snprintf(filename, sizeof(filename), "attachment; filename=\"littlefs_backup_%s_%s.tar\"",
+                     deviceId, timestamp);
+            response->addHeader("Content-Disposition", filename);
+
+            LOG_INFO("LittleFS backup streaming started: littlefs_backup_%s_%s.tar", deviceId, timestamp);
+            request->send(response);
+        });
+    }
+
+    // === RESTORE ENDPOINTS ===
+    static void _serveRestoreEndpoints()
+    {
+        // POST - Restore configuration from JSON backup file (multipart upload)
+        server.on("/api/v1/restore/configuration", HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+                // Final response after file upload completes
+                if (request->_tempObject) {
+                    bool* success = (bool*)request->_tempObject;
+                    if (*success) {
+                        _sendSuccessResponse(request, "Configuration restore initiated. Device will restart.");
+                    } else {
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Failed to process backup file. Check logs");
+                    }
+                    delete success;
+                    request->_tempObject = nullptr;
+                }
+            },
+            [](AsyncWebServerRequest *request, const String& filename,
+               size_t index, uint8_t *data, size_t len, bool final) {
+
+                static File restoreFile;
+                static String tempPath = "/restore/nvs_restore_upload.json";
+                static bool isValid = true;
+                static bool restoreInProgress = false;
+
+                if (!index) {
+                    // First chunk - check if restore already in progress
+                    if (restoreInProgress) {
+                        LOG_WARNING("Configuration restore already in progress, rejecting new request");
+                        _sendErrorResponse(request, HTTP_CODE_CONFLICT,
+                            "Restore already in progress. Please wait for current restore to complete.");
+                        return;
+                    }
+                    restoreInProgress = true;
+
+                    // First chunk - create restore directory and file
+                    LOG_INFO("Starting configuration restore upload");
+
+                    if (!LittleFS.exists("/restore")) {
+                        LittleFS.mkdir("/restore");
+                    }
+
+                    // Remove old temp file if exists
+                    if (LittleFS.exists(tempPath)) {
+                        LittleFS.remove(tempPath);
+                    }
+
+                    restoreFile = LittleFS.open(tempPath, FILE_WRITE);
+                    if (!restoreFile) {
+                        LOG_ERROR("Failed to create temp restore file");
+                        isValid = false;
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to create restore file");
+                        return;
+                    }
+                    isValid = true;
+                }
+
+                // Write chunk
+                if (len && isValid && restoreFile) {
+                    size_t written = restoreFile.write(data, len);
+                    if (written != len) {
+                        LOG_ERROR("Failed to write restore file chunk");
+                        isValid = false;
+                        restoreFile.close();
+                        LittleFS.remove(tempPath);
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to write restore data");
+                        return;
+                    }
+                }
+
+                // Final chunk - validate and process JSON
+                if (final && isValid && restoreFile) {
+                    restoreInProgress = false;
+                    restoreFile.close();
+                    LOG_DEBUG("Backup file upload complete, validating...");
+
+                    // Parse and validate JSON
+                    File uploadedFile = LittleFS.open(tempPath, FILE_READ);
+                    if (!uploadedFile) {
+                        LOG_ERROR("Failed to read uploaded restore file");
+                        isValid = false;
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to read restore file");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    SpiRamAllocator allocator;
+                    JsonDocument doc(&allocator);
+                    DeserializationError jsonError = deserializeJson(doc, uploadedFile);
+                    uploadedFile.close();
+
+                    if (jsonError) {
+                        LOG_ERROR("Invalid JSON in backup: %s", jsonError.c_str());
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid JSON format");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Validate backup structure
+                    if (!doc["version"].is<int>() || doc["version"] != 1 ||
+                        !doc["type"].is<const char*>() || strcmp(doc["type"], "configuration") != 0 ||
+                        !doc["nvs"].is<JsonObject>()) {
+                        LOG_ERROR("Invalid backup format or version");
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Invalid backup format");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Check firmware version compatibility
+                    if (!doc["firmwareVersion"].is<const char*>()) {
+                        LOG_ERROR("Backup missing firmware version");
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, "Backup missing firmware version");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    const char* backupFwVersion = doc["firmwareVersion"];
+                    if (!isBackupVersionCompatible(backupFwVersion)) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                            "Firmware version incompatible: backup from %s, current %s. "
+                            "Can only restore backups from same major version <= current.",
+                            backupFwVersion, FIRMWARE_BUILD_VERSION);
+                        LOG_WARNING("%s", msg);
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, msg);
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Check device ID mismatch (warn but allow with ?force=true)
+                    bool forceRestore = request->hasParam("force") &&
+                                       request->getParam("force")->value() == "true";
+
+                    const char* backupDeviceId = doc["deviceId"];
+                    char currentDeviceId[DEVICE_ID_BUFFER_SIZE];
+                    getDeviceId(currentDeviceId, sizeof(currentDeviceId));
+
+                    if (backupDeviceId && strcmp(backupDeviceId, currentDeviceId) != 0 && !forceRestore) {
+                        char msg[200];
+                        snprintf(msg, sizeof(msg),
+                            "Device ID mismatch: backup from %s, current device %s. Use ?force=true to override.",
+                            backupDeviceId, currentDeviceId);
+                        LOG_WARNING("%s", msg);
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST, msg);
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    // Validate namespace exclusions (ensure no sensitive data)
+                    const char* excludedNamespaces[] = {"auth_ns", "nvs.net80211", "phy", "certificates_ns"};
+                    for (JsonPair nsPair : doc["nvs"].as<JsonObject>()) {
+                        for (const char* excluded : excludedNamespaces) {
+                            if (strcmp(nsPair.key().c_str(), excluded) == 0) {
+                                LOG_ERROR("Backup contains excluded namespace: %s", nsPair.key().c_str());
+                                LittleFS.remove(tempPath);
+                                _sendErrorResponse(request, HTTP_CODE_BAD_REQUEST,
+                                    "Backup contains excluded namespace (security/device-specific data)");
+                                bool* result = new bool(false);
+                                request->_tempObject = result;
+                                return;
+                            }
+                        }
+                    }
+
+                    // All validation passed - save for boot-time restore
+                    File finalRestoreFile = LittleFS.open("/restore/nvs_restore.json", FILE_WRITE);
+                    if (!finalRestoreFile) {
+                        LOG_ERROR("Failed to create final restore file");
+                        LittleFS.remove(tempPath);
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to save restore file");
+                        bool* result = new bool(false);
+                        request->_tempObject = result;
+                        return;
+                    }
+
+                    serializeJson(doc, finalRestoreFile);
+                    finalRestoreFile.close();
+                    LittleFS.remove(tempPath);
+
+                    // Set restore pending flag in NVS
+                    Preferences prefs;
+                    if (prefs.begin(PREFERENCES_NAMESPACE_GENERAL, false)) {
+                        prefs.putBool("restore_pending", true);
+                        prefs.end();
+                    }
+
+                    LOG_INFO("Configuration restore staged. Device will restart.");
+                    bool* result = new bool(true);
+                    request->_tempObject = result;
+
+                    // Trigger restart after response sent
+                    setRestartSystem("Configuration restore");
+                }
+            }
+        );
+
+        // POST - Restore filesystem from TAR file upload (saves to LittleFS then extracts)
+        server.on("/api/v1/restore/filesystem", HTTP_POST,
+            [](AsyncWebServerRequest *request) {
+                // Final response after file upload completes
+                if (request->_tempObject) {
+                    bool* success = (bool*)request->_tempObject;
+                    if (*success) {
+                        _sendSuccessResponse(request, "Filesystem restored successfully");
+                    } else {
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Filesystem restore failed");
+                    }
+                    delete success;
+                    request->_tempObject = nullptr;
+                }
+            },
+            [](AsyncWebServerRequest *request, const String& filename,
+               size_t index, uint8_t *data, size_t len, bool final) {
+
+                static File restoreFile;
+                static String tempPath = "/restore/filesystem_restore.tar";
+                static bool isValid = true;
+                static bool restoreInProgress = false;
+
+                if (!index) {
+                    // First chunk - check if restore already in progress
+                    if (restoreInProgress) {
+                        LOG_WARNING("Filesystem restore already in progress, rejecting new request");
+                        _sendErrorResponse(request, HTTP_CODE_CONFLICT,
+                            "Restore already in progress. Please wait for current restore to complete.");
+                        return;
+                    }
+                    restoreInProgress = true;
+
+                    // First chunk - create restore directory and file
+                    LOG_INFO("Starting filesystem restore upload: %s", filename.c_str());
+
+                    if (!LittleFS.exists("/restore")) {
+                        LittleFS.mkdir("/restore");
+                    }
+
+                    // Remove old temp file if exists
+                    if (LittleFS.exists(tempPath)) {
+                        LittleFS.remove(tempPath);
+                    }
+
+                    restoreFile = LittleFS.open(tempPath, FILE_WRITE);
+                    if (!restoreFile) {
+                        LOG_ERROR("Failed to create temp restore file");
+                        isValid = false;
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to create restore file");
+                        return;
+                    }
+                    isValid = true;
+                }
+
+                // Write chunk
+                if (len && isValid && restoreFile) {
+                    size_t written = restoreFile.write(data, len);
+                    if (written != len) {
+                        LOG_ERROR("Failed to write restore file chunk");
+                        isValid = false;
+                        restoreFile.close();
+                        LittleFS.remove(tempPath);
+                        restoreInProgress = false;
+                        _sendErrorResponse(request, HTTP_CODE_INTERNAL_SERVER_ERROR,
+                            "Failed to write restore data");
+                        return;
+                    }
+                }
+
+                // Final chunk - extract TAR to filesystem
+                if (final && isValid && restoreFile) {
+                    restoreInProgress = false;
+                    restoreFile.close();
+                    LOG_DEBUG("TAR file upload complete, extracting...");
+
+                    bool extractSuccess = false;
+
+                    TarUnpacker *tarUnpacker = new TarUnpacker();
+                    tarUnpacker->haltOnError(true);
+                    tarUnpacker->setTarVerify(true);
+
+                    // Feed watchdog on each file extracted to prevent HTTP timeout during long extraction
+                    tarUnpacker->setTarStatusProgressCallback([](const char* name, size_t size, size_t total_unpacked) {
+                        esp_task_wdt_reset();
+                        LOG_DEBUG("Extracting: %s (%zu bytes, total unpacked: %zu)", name, size, total_unpacked);
+                    });
+
+                    // Extract: sourceFS, sourcePath, destFS, destPath
+                    if (tarUnpacker->tarExpander(LittleFS, tempPath.c_str(), LittleFS, "/")) {
+                        LOG_INFO("Filesystem restore extraction successful");
+                        extractSuccess = true;
+                    } else {
+                        LOG_ERROR("TAR extraction failed with error code: %d", tarUnpacker->tarGzGetError());
+                    }
+
+                    delete tarUnpacker;
+
+                    // Clean up temp file
+                    LittleFS.remove(tempPath);
+
+                    // Store result for completion handler
+                    bool* result = new bool(extractSuccess);
+                    request->_tempObject = result;
+                }
+            }
+        );
+    }
+
     // === FILE OPERATION ENDPOINTS ===
-    // TODO: add full backup/restore endpoint (NVS + LittleFS in a single file) to allow data export and device restoration
     static void _serveFileEndpoints()
     {
         // List files in LittleFS. The endpoint cannot be only "files" as it conflicts with the file serving endpoint (defined below)

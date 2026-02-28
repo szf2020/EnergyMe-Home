@@ -638,15 +638,6 @@ paths:
           $ref: '#/components/responses/Success'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '507':
-          description: Insufficient storage space
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-              example:
-                success: false
-                error: "Insufficient storage space"
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -687,6 +678,274 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # Backup endpoints
+  /api/v1/backup/configuration:
+    get:
+      summary: Download configuration backup as JSON file
+      description: |
+        Export the complete NVS configuration data as JSON for backup or transfer to another device.
+
+        **Response:**
+        - Returns JSON file with `Content-Disposition: attachment` header to force download
+        - Filename format: `config_backup_<deviceId>_<timestamp>.json`
+        - Each NVS key includes explicit type metadata for accurate restoration
+      tags:
+        - Backup
+      responses:
+        '200':
+          description: Configuration backup data
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - version
+                  - type
+                  - deviceId
+                  - firmwareVersion
+                  - sketchMD5
+                  - timestamp
+                  - nvs
+                properties:
+                  version:
+                    type: integer
+                    description: Backup format version
+                    example: 1
+                  type:
+                    type: string
+                    description: Backup type identifier
+                    example: "configuration"
+                  deviceId:
+                    type: string
+                    description: Unique device identifier
+                    example: "A1B2C3D4E5F6"
+                  firmwareVersion:
+                    type: string
+                    description: Current firmware version
+                    example: "00.11.09"
+                  sketchMD5:
+                    type: string
+                    description: MD5 hash of the current firmware sketch
+                    example: "ad1783afd0b38f856d5010921712e2ed"
+                  timestamp:
+                    type: string
+                    format: date-time
+                    description: Backup timestamp in ISO 8601 format
+                    example: "2025-02-15T10:30:45Z"
+                  nvs:
+                    type: object
+                    description: NVS data organized by namespace
+                    additionalProperties:
+                      type: object
+                      description: Namespace containing configuration keys and values
+                      additionalProperties: true
+                    example:
+                      "preferences":
+                        "sampleTime": 
+                          type: u16
+                          value: 1000
+                        "enabled":
+                          type: u8
+                          value: 1
+                      "mqtt":
+                        "server":
+                          type: str
+                          value: "mqtt.example.com"
+                        "port":
+                          type: u16
+                          value: 1883
+          headers:
+            Content-Disposition:
+              description: File download header with device ID and ISO timestamp
+              schema:
+                type: string
+              example: 'attachment; filename="config_backup_588c81c47a50_2026-02-16T13:01:54.177Z.json"'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/backup/filesystem:
+    get:
+      summary: Download LittleFS filesystem backup (no temporary files)
+      description: |
+        Downloads a complete backup of the LittleFS filesystem as a TAR archive.
+        Includes all energy data files, logs, and configuration files.
+
+        **Key Features:**
+        - **NO temporary files created in LittleFS** (works even when filesystem is >50% full)
+        - Streamed directly from source files to HTTP response
+        - Transfer typically completes in 1-2 seconds on local network
+        - Supports multiple concurrent downloads
+
+        **Extraction:**
+        Extract on any system with tar support:
+        ```bash
+        tar -xf littlefs_backup_<deviceId>_<timestamp>.tar
+        ```
+
+        **Compression:**
+        Archive is uncompressed TAR format (energy files are already .csv.gz).
+        To compress after download:
+        ```bash
+        gzip littlefs_backup_<deviceId>_<timestamp>.tar
+        ```
+      tags:
+        - Backup
+      responses:
+        '200':
+          description: Backup streamed successfully
+          content:
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              description: File download header with device ID and ISO timestamp
+              schema:
+                type: string
+              example: 'attachment; filename="littlefs_backup_588c81c47a50_2026-02-16T13:01:54.177Z.tar"'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/restore/configuration:
+    post:
+      summary: Restore configuration from backup file
+      description: |
+        Restore NVS configuration from a previously downloaded backup JSON file.
+
+        **Process:**
+        1. Upload backup JSON file (multipart/form-data)
+        2. Validates backup JSON format and metadata
+        3. Checks firmware version compatibility (same major version, >= backup version)
+        4. Checks device ID compatibility (configurable with ?force=true)
+        5. Validates no excluded namespaces present (security/device-specific data)
+        6. Saves validated backup to temporary storage
+        7. Sets restore flag in NVS and triggers device restart
+        8. During boot, restores all NVS keys before services start (natural "blocked state")
+        9. Device continues normal boot with restored configuration
+
+        **Important Notes:**
+        - Backup must be from same major firmware version (e.g., 1.x.x can restore on 1.y.z where y.z >= x.x)
+        - Restores values exactly as they were backed up (type-safe with explicit type metadata)
+        - Skips sensitive namespaces: auth_ns, nvs.net80211, phy, certificates_ns
+        - Device will restart automatically
+        - Cross-device restore is blocked by default (use ?force=true to override)
+        - Partial restore continues even if some keys fail to restore
+
+        **Example curl command:**
+        ```bash
+        curl --digest -u admin:energyme00 -X POST \
+          -F "file=@config_backup_deviceid_timestamp.json" \
+          http://192.168.2.75/api/v1/restore/configuration
+        ```
+      tags:
+        - Restore
+      parameters:
+        - name: force
+          in: query
+          schema:
+            type: boolean
+          description: Skip device ID validation (allows cross-device restore)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Configuration backup JSON file (must include version, type, firmwareVersion, and nvs fields)
+      responses:
+        '200':
+          description: Configuration restore initiated (device will restart)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "success"
+                  message:
+                    type: string
+                    example: "Configuration restore initiated. Device will restart."
+        '400':
+          description: Invalid backup format, version mismatch, or device mismatch
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "error"
+                  message:
+                    type: string
+                    example: "Firmware version incompatible: backup from 1.5.0, current 1.0.0. Can only restore backups from same major version <= current."
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/restore/filesystem:
+    post:
+      summary: Restore filesystem from TAR backup
+      description: |
+        Restore LittleFS filesystem from a previously downloaded TAR archive.
+
+        **Process:**
+        1. Validates available storage space
+        2. Receives and saves TAR file to temporary location in LittleFS
+        3. Extracts TAR archive to LittleFS root (overwrites existing files)
+        4. Removes temporary TAR file
+
+        **Important Notes:**
+        - Extraction overwrites existing files with same names
+        - Requires sufficient free space to temporarily store the TAR file
+        - All timestamps and permissions are normalized during extraction
+      tags:
+        - Restore
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: LittleFS TAR backup file
+      responses:
+        '200':
+          description: Filesystem restored successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "success"
+                  message:
+                    type: string
+                    example: "Filesystem restored successfully"
+        '400':
+          description: Invalid TAR format
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "error"
+                  message:
+                    type: string
+                    example: "Invalid TAR format"
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -2413,7 +2672,11 @@ tags:
     description: LED brightness control and status endpoints
   - name: Files
     description: LittleFS file system operations and management endpoints
-
+  - name: Backup
+    description: Configuration backup and export endpoints
+  - name: Restore
+    description: Configuration restore and import endpoints
+    
 components:
   # Common response patterns
   responses:

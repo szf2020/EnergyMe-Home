@@ -38,6 +38,7 @@
 #include "led.h"
 #include "structs.h"
 #include "globals.h"
+#include "ringbufferstream.h"
 
 #define TASK_RESTART_NAME "restart_task"
 #define TASK_RESTART_STACK_SIZE (6 * 1024)
@@ -47,6 +48,10 @@
 #define TASK_MAINTENANCE_STACK_SIZE (5 * 1024)     // Maximum usage close to 5 kB
 #define TASK_MAINTENANCE_PRIORITY 3
 #define MAINTENANCE_CHECK_INTERVAL (60 * 1000)
+
+#define TASK_TAR_PACKER_NAME "tar_packer"
+#define TASK_TAR_PACKER_STACK_SIZE (8 * 1024)
+#define TASK_TAR_PACKER_PRIORITY 3
 
 // System restart thresholds
 #define MINIMUM_FREE_HEAP_SIZE (1 * 1024) // Below this value (in bytes), the system will restart. This value can get very low due to the presence of the PSRAM to support
@@ -58,6 +63,9 @@
 
 // First boot
 #define IS_FIRST_BOOT_DONE_KEY "first_boot"
+
+// NVS to JSON
+#define NVS_STRING_MAX_SIZE 512 // Reasonable size for string values going in the JSON from the NVS
 
 // Stringify macro helper for BUILD_ENV_NAME - If you try to concatenate directly, it will crash the build
 #define STRINGIFY(x) #x
@@ -104,7 +112,7 @@ inline bool isStringLengthValid(const char* str, size_t minLength, size_t maxLen
 
 // Numeric range validation utilities
 inline bool isValueInRange(float value, float min, float max) {
-    return value > min && value <= max;
+    return value >= min && value <= max;
 }
 
 inline bool isValueInRange(int32_t value, int32_t min, int32_t max) {
@@ -113,10 +121,12 @@ inline bool isValueInRange(int32_t value, int32_t min, int32_t max) {
 
 // Mathematical utilities
 uint64_t calculateExponentialBackoff(uint64_t attempt, uint64_t initialInterval, uint64_t maxInterval, uint64_t multiplier);
+
 inline float roundToDecimals(float value, uint8_t decimals = 3) {
     float factor = powf(10.0f, decimals);
     return roundf(value * factor) / factor;
 }
+
 inline double roundToDecimals(double value, uint8_t decimals = 3) {
     double factor = pow(10.0, decimals);
     return round(value * factor) / factor;
@@ -200,6 +210,16 @@ void migrateCsvToGzip(const char* dirPath, const char* excludePrefix = nullptr);
 bool migrateEnergyFilesToDailyFolder(); // One-time migration of existing /energy/*.csv.gz to /energy/daily/
 bool consolidateDailyFilesToMonthly(const char* yearMonth, const char* excludeDate = nullptr); // Consolidate daily files for YYYY-MM into monthly archive (optionally exclude a specific date)
 bool consolidateMonthlyFilesToYearly(const char* year, const char* excludeMonth = nullptr); // Consolidate monthly files for YYYY into yearly archive (optionally exclude a specific month)
+
+// Backup utilities
+bool nvsDataToJson(JsonObject &doc);
+RingBufferStream* startStreamingBackup();              // Start async TAR creation to RingBufferStream (no temp file, true streaming)
+
+// Restore utilities
+bool isNvsRestorePending();                            // Check if configuration restore is pending (boot-time check)
+void performNvsRestore();                              // Perform configuration restore from staged file (boot-time)
+bool restoreNvsFromJson(JsonDocument &doc);            // Restore NVS from JSON document (inverse of nvsDataToJson)
+bool isBackupVersionCompatible(const char* backupVersion); // Check if backup version is compatible with current firmware
 
 // String utilities
 inline bool endsWith(const char* s, const char* suffix) {
