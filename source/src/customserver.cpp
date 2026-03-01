@@ -758,6 +758,9 @@ namespace CustomServer
         server.on("/css/section.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
             _sendStaticWithEtag(request, "text/css", section_css, etag);
         });
+        server.on("/css/tooltip.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "text/css", tooltip_css, etag);
+        });
         server.on("/css/typography.css", HTTP_GET, [etag](AsyncWebServerRequest *request) {
             _sendStaticWithEtag(request, "text/css", typography_css, etag);
         });
@@ -774,6 +777,9 @@ namespace CustomServer
         });
         server.on("/js/power-flow.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
             _sendStaticWithEtag(request, "application/javascript", power_flow_js, etag);
+        });
+        server.on("/js/tooltip.js", HTTP_GET, [etag](AsyncWebServerRequest *request) {
+            _sendStaticWithEtag(request, "application/javascript", tooltip_js, etag);
         });
 
         // Resources
