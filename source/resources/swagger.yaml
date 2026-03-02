@@ -2321,41 +2321,41 @@ paths:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    description: All channels response
-                    properties:
-                      index:
-                        type: integer
-                        description: Channel index
-                      label:
-                        type: string
-                        description: Channel label
-                      phase:
-                        type: integer
-                        description: Channel phase (1, 2, 3, or 4 for 240V split-phase)
-                      groupLabel:
-                        type: string
-                        description: Channel group label (if configured)
-                      role:
-                        type: string
-                        description: Channel role (load, grid, pv, battery, inverter)
-                      data:
-                        type: array
-                        items:
+                  - type: array
+                    description: All channels response (when index omitted)
+                    items:
+                      type: object
+                      properties:
+                        index:
+                          type: integer
+                          description: Channel index
+                        label:
+                          type: string
+                          description: Channel label
+                        phase:
+                          type: integer
+                          description: Channel phase (1, 2, 3, or 4 for 240V split-phase)
+                        groupLabel:
+                          type: string
+                          description: Channel group label (if configured)
+                        role:
+                          type: string
+                          description: Channel role (load, grid, pv, battery, inverter)
+                        data:
                           $ref: '#/components/schemas/MeterValues'
                   - $ref: '#/components/schemas/MeterValues'
-                    description: Single channel response
+                    description: Single channel response (when index provided)
               examples:
                 all_channels:
                   summary: All channels response
                   value:
-                    index: 0
-                    label: "Main Circuit"
-                    phase: 1
-                    groupLabel: "Group 0"
-                    role: "grid"
-                    data:
-                      - voltage: 230.2
+                    - index: 0
+                      label: "Main Circuit"
+                      phase: 1
+                      groupLabel: "Group 0"
+                      role: "grid"
+                      data:
+                        voltage: 230.2
                         current: 5.45
                         activePower: 1254.6
                         reactivePower: 45.2

@@ -2254,10 +2254,15 @@ namespace Mqtt
 
     static void _handleConnectedState() {
         // MQTT connection check is sufficient - if TCP to AWS fails, we'll detect it here
-        if (!CustomWifi::isFullyConnected() || !_clientMqtt.connected() || !_clientMqtt.loop()) { // Also process incoming messages with loop()
+        // Use vars explicitly here so later in the logs they have the same exact values
+        bool wifiOk = CustomWifi::isFullyConnected();
+        bool mqttConnected = _clientMqtt.connected();
+        bool mqttLoopOk = _clientMqtt.loop(); // Also process incoming messages with loop()
+
+        if (!wifiOk || !mqttConnected || !mqttLoopOk) {
             LOG_DEBUG(
                 "MQTT disconnected, transitioning to connecting state (wifi: %d, connected: %d, loop: %d)", 
-                CustomWifi::isFullyConnected(), _clientMqtt.connected(), _clientMqtt.loop()
+                wifiOk, mqttConnected, mqttLoopOk
             );
             statistics.mqttConnectionErrors++;
             _setState(MqttState::CONNECTING);
