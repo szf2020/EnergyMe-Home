@@ -45,3 +45,6 @@ secrets
 
 # CodeQL
 _codeql_detected_source_root
+
+# AI stuff
+.claude
