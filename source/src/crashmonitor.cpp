@@ -290,23 +290,6 @@ namespace CrashMonitor
     uint32_t getResetCount() {return _resetCount;}
     uint32_t getConsecutiveResetCount() {return _consecutiveResetCount;}
 
-    const char* getResetReasonString(esp_reset_reason_t reason) {
-        switch (reason) {
-            case ESP_RST_UNKNOWN: return "Unknown";
-            case ESP_RST_POWERON: return "Power on";
-            case ESP_RST_EXT: return "External pin";
-            case ESP_RST_SW: return "Software";
-            case ESP_RST_PANIC: return "Exception/panic";
-            case ESP_RST_INT_WDT: return "Interrupt watchdog";
-            case ESP_RST_TASK_WDT: return "Task watchdog";
-            case ESP_RST_WDT: return "Other watchdog";
-            case ESP_RST_DEEPSLEEP: return "Deep sleep";
-            case ESP_RST_BROWNOUT: return "Brownout";
-            case ESP_RST_SDIO: return "SDIO";
-            default: return "Undefined";
-        }
-    }
-
     void _handleCounters() {
         // This is the LAST RESORT - only triggered after safe mode failed to resolve the issue
         // Safe mode should have already prevented most rapid restart loops
@@ -352,6 +335,7 @@ namespace CrashMonitor
             return;
         }
 
+        // TODO: if we find a crash dump, save it immediately to LittleFS (how? binary blob?) in a folder with the current datetime ISO, in the folder the binary blob anad a JSON with metadata
         LOG_INFO("Core dump found from previous crash, retrieving summary...");
         
         // Log only essential crash data for analysis
@@ -538,7 +522,7 @@ namespace CrashMonitor
         LOG_WARNING("=== End Crash Analysis ===");
     }
 
-    bool getCoreDumpInfoJson(JsonDocument &doc) {
+    bool getCoreDumpInfoJson(JsonDocument &doc) { // TODO: this should instead save the binary blob to LittleFS with the unix timestamp of when it happened and the elf256 partial as name. THen later updated, but immediately cleared from partition
         // Basic crash information
         esp_reset_reason_t resetReason = esp_reset_reason();
         doc["resetReason"] = getResetReasonString(resetReason);

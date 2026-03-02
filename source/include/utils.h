@@ -38,6 +38,7 @@
 #include "led.h"
 #include "structs.h"
 #include "globals.h"
+#include "ringbufferstream.h"
 
 #define TASK_RESTART_NAME "restart_task"
 #define TASK_RESTART_STACK_SIZE (6 * 1024)
@@ -48,23 +49,23 @@
 #define TASK_MAINTENANCE_PRIORITY 3
 #define MAINTENANCE_CHECK_INTERVAL (60 * 1000)
 
+#define TASK_TAR_PACKER_NAME "tar_packer"
+#define TASK_TAR_PACKER_STACK_SIZE (8 * 1024)
+#define TASK_TAR_PACKER_PRIORITY 3
+
 // System restart thresholds
 #define MINIMUM_FREE_HEAP_SIZE (1 * 1024) // Below this value (in bytes), the system will restart. This value can get very low due to the presence of the PSRAM to support
 #define MINIMUM_FREE_PSRAM_SIZE (10 * 1024) // Below this value (in bytes), the system will restart
 #define MINIMUM_FREE_LITTLEFS_SIZE (10 * 1024) // Below this value (in bytes), the system will clear the log
-#define SYSTEM_RESTART_DELAY (3 * 1000) // The delay before restarting the system after a restart request, needed to allow the system to finish the current operations (like flushing logs)
+#define SYSTEM_RESTART_FAILSAFE_TIMER_NAME "restart_failsafe"
+#define SYSTEM_RESTART_FAILSAFE_TIMEOUT (10 * 1000) // Failsafe timeout - if restart doesn't complete within this time, force restart via timer
 #define MINIMUM_FIRMWARE_SIZE (100 * 1024) // Minimum firmware size in bytes (100KB) - prevents empty/invalid uploads
-#define STOP_SERVICES_TASK_NAME "stop_services_task"
-#define STOP_SERVICES_TASK_STACK_SIZE (6 * 1024)
-#define STOP_SERVICES_TASK_PRIORITY 10
-
-// Restart infos
-#define FUNCTION_NAME_BUFFER_SIZE 32
-#define REASON_BUFFER_SIZE 128
-#define JSON_STRING_PRINT_BUFFER_SIZE 512 // For JSON strings (print only, needed usually for debugging - Avoid being too large to prevent stack overflow)
 
 // First boot
 #define IS_FIRST_BOOT_DONE_KEY "first_boot"
+
+// NVS to JSON
+#define NVS_STRING_MAX_SIZE 512 // Reasonable size for string values going in the JSON from the NVS
 
 // Stringify macro helper for BUILD_ENV_NAME - If you try to concatenate directly, it will crash the build
 #define STRINGIFY(x) #x
@@ -102,12 +103,30 @@ inline uint64_t micros64() {
 // Validation utilities
 inline bool isChannelValid(uint8_t channel) {return channel < CHANNEL_COUNT;}
 
+// String validation utilities
+inline bool isStringLengthValid(const char* str, size_t minLength, size_t maxLength) {
+    if (str == nullptr) return false;
+    size_t len = strlen(str);
+    return len >= minLength && len <= maxLength;
+}
+
+// Numeric range validation utilities
+inline bool isValueInRange(float value, float min, float max) {
+    return value >= min && value <= max;
+}
+
+inline bool isValueInRange(int32_t value, int32_t min, int32_t max) {
+    return value >= min && value <= max;
+}
+
 // Mathematical utilities
 uint64_t calculateExponentialBackoff(uint64_t attempt, uint64_t initialInterval, uint64_t maxInterval, uint64_t multiplier);
+
 inline float roundToDecimals(float value, uint8_t decimals = 3) {
     float factor = powf(10.0f, decimals);
     return roundf(value * factor) / factor;
 }
+
 inline double roundToDecimals(double value, uint8_t decimals = 3) {
     double factor = pow(10.0, decimals);
     return round(value * factor) / factor;
@@ -154,6 +173,22 @@ TaskInfo getMaintenanceTaskInfo();
 
 // System restart and maintenance
 bool setRestartSystem(const char* reason, bool factoryReset = false);
+inline const char* getResetReasonString(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_UNKNOWN: return "Unknown";
+        case ESP_RST_POWERON: return "Power on";
+        case ESP_RST_EXT: return "External pin";
+        case ESP_RST_SW: return "Software";
+        case ESP_RST_PANIC: return "Exception/panic";
+        case ESP_RST_INT_WDT: return "Interrupt watchdog";
+        case ESP_RST_TASK_WDT: return "Task watchdog";
+        case ESP_RST_WDT: return "Other watchdog";
+        case ESP_RST_DEEPSLEEP: return "Deep sleep";
+        case ESP_RST_BROWNOUT: return "Brownout";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "Undefined";
+    }
+}
 
 // JSON utilities
 bool safeSerializeJson(JsonDocument &jsonDocument, char* buffer, size_t bufferSize, bool truncateOnError = false);
@@ -175,6 +210,16 @@ void migrateCsvToGzip(const char* dirPath, const char* excludePrefix = nullptr);
 bool migrateEnergyFilesToDailyFolder(); // One-time migration of existing /energy/*.csv.gz to /energy/daily/
 bool consolidateDailyFilesToMonthly(const char* yearMonth, const char* excludeDate = nullptr); // Consolidate daily files for YYYY-MM into monthly archive (optionally exclude a specific date)
 bool consolidateMonthlyFilesToYearly(const char* year, const char* excludeMonth = nullptr); // Consolidate monthly files for YYYY into yearly archive (optionally exclude a specific month)
+
+// Backup utilities
+bool nvsDataToJson(JsonObject &doc);
+RingBufferStream* startStreamingBackup();              // Start async TAR creation to RingBufferStream (no temp file, true streaming)
+
+// Restore utilities
+bool isNvsRestorePending();                            // Check if configuration restore is pending (boot-time check)
+void performNvsRestore();                              // Perform configuration restore from staged file (boot-time)
+bool restoreNvsFromJson(JsonDocument &doc);            // Restore NVS from JSON document (inverse of nvsDataToJson)
+bool isBackupVersionCompatible(const char* backupVersion); // Check if backup version is compatible with current firmware
 
 // String utilities
 inline bool endsWith(const char* s, const char* suffix) {

@@ -12,8 +12,9 @@ class EnergyMeAPI {
             'Content-Type': 'application/json',
             'Connection': 'close'  // Prevent keep-alive to reduce ESP32 load
         };
-        this.getTimeoutMs = 3000;
-        this.otherTimeoutMs = 5000;
+        this.getTimeoutMs = 5000;
+        this.otherTimeoutMs = 10000;
+        this.longTimeoutMs = 30000; // For operations that may take longer (e.g. backups)
     }
 
     /**
@@ -49,10 +50,9 @@ class EnergyMeAPI {
 
         const config = {
             ...options,
-            headers: {
-                ...this.defaultHeaders,
-                ...options.headers
-            }
+            headers: options.headers !== undefined
+                ? { ...options.headers }           // Caller-provided headers only (e.g. {} for multipart)
+                : { ...this.defaultHeaders }       // Default headers for normal JSON calls
         };
 
         try {
@@ -184,9 +184,10 @@ class EnergyMeAPI {
 
     /**
      * Patch channel configuration (partial update)
+     * Note: channelData must include 'index' field
      */
-    async patchChannelConfig(index, channelData) {
-        return this.patch(`ade7953/channel?index=${index}`, channelData);
+    async patchChannelConfig(channelData) {
+        return this.patch('ade7953/channel', channelData);
     }
 
     /**
@@ -303,10 +304,14 @@ class EnergyMeAPI {
     }
 
     /**
-     * Reset energy values
+     * Reset energy values for a specific channel or all channels
+     * @param {number} [channelIndex] - Optional channel index. If omitted, resets all channels.
      */
-    async resetEnergyValues() {
-        return this.post('ade7953/energy/reset');
+    async resetEnergyValues(channelIndex) {
+        const url = channelIndex !== undefined
+            ? `ade7953/energy/reset?index=${channelIndex}`
+            : 'ade7953/energy/reset';
+        return this.post(url);
     }
 
     /**
@@ -490,14 +495,7 @@ class EnergyMeAPI {
     async setAde7953SampleTime(sampleTime) {
         return this.put('ade7953/sample-time', { sampleTime });
     }
-
-    /**
-     * Reset channel configuration
-     */
-    async resetChannelConfig(index) {
-        return this.post(`ade7953/channel/reset?index=${index}`);
-    }
-
+    
     /**
      * Read ADE7953 register
      */
@@ -510,18 +508,6 @@ class EnergyMeAPI {
      */
     async writeAde7953Register(address, value, bits = 32, signed = false) {
         return this.put('ade7953/register', { address, value, bits, signed });
-    }
-
-    /**
-     * Set energy values
-     */
-    async setEnergyValues(index, activeEnergyImported, reactiveEnergyImported, apparentEnergyImported) {
-        return this.put('ade7953/energy', {
-            index,
-            activeEnergyImported,
-            reactiveEnergyImported,
-            apparentEnergyImported
-        });
     }
 
     /**
@@ -544,10 +530,218 @@ class EnergyMeAPI {
     async getFileAsText(filepath) {
         return this.get(`files/${encodeURIComponent(filepath)}`, { responseType: 'text' });
     }
+
+    /**
+     * Upload a file to LittleFS
+     * @param {string} filepath - Target file path on device
+     * @param {File|Blob} file - File to upload
+     */
+    async uploadFile(filepath, file) {
+        const formData = new FormData();
+        formData.append('file', file, filepath);
+        
+        const response = await this.apiCall(`files/${encodeURIComponent(filepath)}`, {
+            method: 'POST',
+            body: formData,
+            headers: {} // Let browser set Content-Type with boundary
+        }, this.otherTimeoutMs);
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`File upload failed: ${response.status} - ${errorText}`);
+        }
+        
+        return response.json().catch(() => ({}));
+    }
+
+    /**
+     * Delete a file from LittleFS
+     * @param {string} filepath - File path to delete
+     */
+    async deleteFile(filepath) {
+        return this.post('delete-file', { filepath });
+    }
+
+    /**
+     * Get safe mode status
+     */
+    async getSafeModeStatus() {
+        return this.get('system/safe-mode');
+    }
+
+    /**
+     * Clear safe mode
+     */
+    async clearSafeMode() {
+        return this.post('system/safe-mode/clear');
+    }
+
+    /**
+     * Get UDP log destination
+     */
+    async getUdpLogDestination() {
+        return this.get('logs-udp-destination');
+    }
+
+    /**
+     * Set UDP log destination
+     * @param {string} host - UDP destination host
+     * @param {number} port - UDP destination port
+     */
+    async setUdpLogDestination(host, port) {
+        return this.put('logs-udp-destination', { host, port });
+    }
+
+    /**
+     * Update all channels configuration (bulk update)
+     * @param {Array} channels - Array of channel configurations
+     */
+    async updateAllChannels(channels) {
+        return this.put('ade7953/channels', { channels });
+    }
+
+    /**
+     * Arm waveform capture
+     * @param {number} channelIndex - Channel index for capture
+     * @param {string} signal - Signal type to capture
+     */
+    async armWaveformCapture(channelIndex, signal) {
+        return this.post('ade7953/waveform/arm', { index: channelIndex, signal });
+    }
+
+    /**
+     * Get waveform capture status
+     */
+    async getWaveformStatus() {
+        return this.get('ade7953/waveform/status');
+    }
+
+    /**
+     * Get captured waveform data
+     */
+    async getWaveformData() {
+        return this.get('ade7953/waveform/data');
+    }
+
+    /**
+     * Download configuration backup as JSON file
+     * @returns {Promise<Blob>} - JSON backup file blob
+     */
+    async downloadConfigurationBackup() {
+        const response = await this.apiCall('backup/configuration', {
+            method: 'GET'
+        }, this.getTimeoutMs);
+
+        if (!response.ok) {
+            throw new Error(`Configuration backup failed: ${response.status}`);
+        }
+
+        return response.blob();
+    }
+
+    /**
+     * Download filesystem backup as TAR file
+     * @returns {Promise<Blob>} - TAR backup file blob
+     */
+    async downloadFilesystemBackup() {
+        const response = await this.apiCall('backup/filesystem', {
+            method: 'GET'
+        }, this.otherTimeoutMs); // May take longer for large filesystems
+
+        if (!response.ok) {
+            throw new Error(`Filesystem backup failed: ${response.status}`);
+        }
+
+        return response.blob();
+    }
+
+    /**
+     * Restore configuration from JSON backup file
+     * @param {File|Blob} file - JSON backup file
+     * @param {boolean} force - Skip device ID validation (allows cross-device restore)
+     */
+    async restoreConfiguration(file, force = false) {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const url = force ? 'restore/configuration?force=true' : 'restore/configuration';
+
+        const response = await this.apiCall(url, {
+            method: 'POST',
+            body: formData,
+            headers: {} // Let browser set Content-Type with boundary
+        }, this.longTimeoutMs);
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Configuration restore failed: ${response.status} - ${errorText}`);
+        }
+
+        return response.json().catch(() => ({}));
+    }
+
+    /**
+     * Restore filesystem from TAR backup file
+     * @param {File|Blob} file - TAR backup file
+     */
+    async restoreFilesystem(file) {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const response = await this.apiCall('restore/filesystem', {
+            method: 'POST',
+            body: formData,
+            headers: {} // Let browser set Content-Type with boundary
+        }, this.longTimeoutMs);
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Filesystem restore failed: ${response.status} - ${errorText}`);
+        }
+
+        return response.json().catch(() => ({}));
+    }
 }
 
 // Create global instance
 window.energyApi = new EnergyMeAPI();
+
+/**
+ * Show a toast notification.
+ * @param {string} message - Text to display
+ * @param {'success'|'error'|''} type - Message type for coloring ('' or falsy = info)
+ * @param {number} [timeout] - Auto-dismiss after ms (default: 3000 success, 5000 error, 2000 info)
+ */
+function showStatus(message, type, timeout) {
+    if (!message) return;
+
+    // Ensure container exists
+    var container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        document.body.appendChild(container);
+    }
+
+    var toast = document.createElement('div');
+    toast.className = 'toast ' + (type || 'info');
+    toast.textContent = message;
+    container.appendChild(toast);
+
+    // Trigger show after a frame so the transition plays
+    requestAnimationFrame(function() {
+        toast.classList.add('show');
+    });
+
+    if (typeof timeout === 'undefined') {
+        timeout = (type === 'error') ? 5000 : (type === 'success') ? 3000 : 2000;
+    }
+
+    setTimeout(function() {
+        toast.classList.remove('show');
+        setTimeout(function() { toast.remove(); }, 300);
+    }, timeout);
+}
 
 // Backward compatibility aliases
 window.authAPI = window.energyApi;  // For existing code using authAPI

@@ -62,8 +62,15 @@ void setup()
   if (!LittleFS.begin(true)) // Ensure the partition name is "spiffs" in partitions.csv (even when using LittleFS). Setting the partition label to "littlefs" caused issues
   {
     Serial.println("LittleFS initialization failed!");
-    ESP.restart();
+    ESP.restart(); // No reason to live if we cannot mount the filesystem
     return;
+  }
+
+  // Check for pending configuration restore (BEFORE services start = natural "blocked state")
+  if (isNvsRestorePending()) {
+    LOG_DEBUG("Pending configuration restore detected. Starting restore process...");
+    performNvsRestore();
+    LOG_INFO("Configuration restore process completed");
   }
 
   Led::setYellow(Led::PRIO_NORMAL);

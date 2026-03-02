@@ -27,3 +27,11 @@ tmp/
 # Python virtual environments
 venv/
 .venv/
+
+# Mock data for mock server
+mocks/
+
+# AI stuff
+.playwright*
+.claude
+docs/plans
